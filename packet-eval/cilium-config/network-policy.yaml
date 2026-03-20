@@ -1,0 +1,111 @@
+# cilium-config/network-policy.yaml
+#
+# Cilium NetworkPolicy for packet evaluation lab
+#
+# This policy:
+#   1. Allows probe traffic (UDP 9999) between all three evaluation containers
+#   2. Uses Cilium's eBPF datapath (BPF-based forwarding) instead of iptables
+#   3. Enables BPF NodePort for cross-node visibility
+#   4. Enforces identity-based L3/L4 policies via label selectors
+#
+# Cilium eBPF datapath replaces kube-proxy and iptables with BPF maps,
+# reducing forwarding latency by ~30-50% vs. iptables chains.
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: packet-eval-allow-probes
+  namespace: default
+spec:
+  # Apply to all three evaluation pods
+  endpointSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - dpdk-probe
+          - af-xdp-probe
+          - kernel-probe
+
+  ingress:
+    # Allow UDP probe traffic from any evaluation container
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - dpdk-probe
+                - af-xdp-probe
+                - kernel-probe
+      toPorts:
+        - ports:
+            - port: "9999"
+              protocol: UDP
+            - port: "9998"
+              protocol: UDP
+
+  egress:
+    # Allow sending probes to any evaluation container
+    - toEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - dpdk-probe
+                - af-xdp-probe
+                - kernel-probe
+      toPorts:
+        - ports:
+            - port: "9999"
+              protocol: UDP
+            - port: "9998"
+              protocol: UDP
+    # Allow DNS resolution
+    - toEndpoints:
+        - matchLabels:
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+
+---
+# Cilium ConfigMap — key tuning parameters that affect packet latency
+#
+# These settings would be applied to the Cilium DaemonSet in Kubernetes.
+# For the Docker Compose setup they document the equivalent kernel parameters
+# applied via sysctl in docker-compose.yml.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cilium-config
+  namespace: kube-system
+data:
+  # Use eBPF-based kube-proxy replacement — eliminates iptables NAT chains
+  kube-proxy-replacement: "strict"
+
+  # BPF map sizes — increase for high packet rates
+  bpf-ct-global-any-max:  "262144"
+  bpf-ct-global-tcp-max:  "524288"
+  bpf-map-dynamic-size-ratio: "0.0025"
+
+  # Direct routing — skips encapsulation overhead (VXLAN tunnel)
+  routing-mode: "native"
+  auto-direct-node-routes: "true"
+
+  # Disable hubble flow monitoring overhead for latency benchmarks
+  enable-hubble: "false"
+
+  # BPF masquerade — faster than iptables MASQUERADE
+  enable-bpf-masquerade: "true"
+
+  # Bandwidth manager — enables EDT (Earliest Departure Time) pacing
+  enable-bandwidth-manager: "true"
+
+  # XDP acceleration — offload to driver level when hardware supports it
+  # Set to "native" for supported NICs, "generic" for software XDP
+  xdp-acceleration: "generic"
+
+  # Preserve DSCP/TOS markings for QoS
+  preserve-ip-tos: "true"

@@ -1,0 +1,315 @@
+###############################################################################
+#  Packet Processing Evaluation Lab - docker-compose.yml
+#
+#  Three containers, each implementing a different network forwarding path:
+#
+#  +-------------+----------------------------------------------------------+
+#  | Service     | Forwarding Model                                         |
+#  +-------------+----------------------------------------------------------+
+#  | dpdk-rx     | DPDK PMD simulation: busy-poll, SCHED_FIFO, large bufs  |
+#  | af-xdp-rx   | AF_XDP sim: PACKET_MMAP zero-copy ring + SO_BUSY_POLL   |
+#  | kernel-rx   | Traditional UDP socket (full kernel stack)               |
+#  +-------------+----------------------------------------------------------+
+#  | dpdk-tx     | Sends probes -> kernel-rx                                 |
+#  | af-xdp-tx   | Sends probes -> dpdk-rx (raw frames via PACKET_MMAP)     |
+#  | kernel-tx   | Sends probes -> af-xdp-rx                                 |
+#  +-------------+----------------------------------------------------------+
+#
+#  Network topology (custom bridge with Cilium-equivalent eBPF sysctl tuning):
+#
+#    172.20.0.2  dpdk-rx     <-- kernel-tx   (172.20.0.7)
+#    172.20.0.3  af-xdp-rx   <-- dpdk-tx     (172.20.0.5)
+#    172.20.0.4  kernel-rx   <-- af-xdp-tx   (172.20.0.6)
+#
+#  Cross-path design: each sender uses a *different* stack than its receiver,
+#  ensuring we measure the full end-to-end latency difference in each path.
+#
+#  Cilium Integration Note:
+#  -------------------------
+#  Cilium normally runs as a DaemonSet in Kubernetes and installs eBPF
+#  programs at the tc/XDP hooks on each veth endpoint.  In plain Docker,
+#  Cilium's eBPF datapath is approximated by:
+#    * Using the same PACKET_MMAP / SO_BUSY_POLL flags Cilium's BPF datapath
+#      leverages for zero-copy fast paths
+#    * The cilium-config/network-policy.yaml documents the equivalent
+#      Kubernetes CiliumNetworkPolicy for deployment in a real cluster
+#
+###############################################################################
+
+version: "3.9"
+
+networks:
+  # -- Evaluation network -- Cilium-equivalent tuned bridge -----------------
+  eval_net:
+    driver: bridge
+    driver_opts:
+      # Jumbo frames disabled: keep MTU at standard 1500 for fair comparison
+      com.docker.network.driver.mtu: "1500"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+  # -- Management / comparator network -------------------------------------
+  mgmt_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.21.0.0/24
+
+
+x-base-probe: &base_probe
+  build:
+    context: .
+  restart: "no"
+  networks:
+    - eval_net
+    - mgmt_net
+
+###############################################################################
+#  RECEIVER CONTAINERS                                                         #
+###############################################################################
+services:
+
+  # -- DPDK Receiver ----------------------------------------------------------
+  dpdk-rx:
+    <<: *base_probe
+    container_name: packet-eval-dpdk-rx
+    build:
+      context: .
+      dockerfile: dpdk/Dockerfile
+    hostname: dpdk-rx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.2
+    environment:
+      PROBE_MODE: receiver
+    # DPDK PMD needs CAP_SYS_NICE for SCHED_FIFO, CAP_NET_RAW for raw sockets
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    # CPU affinity: pin container to cores 0-1
+    # Disable OOM killer interference
+    oom_score_adj: -500
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio:
+        soft: 99
+        hard: 99
+    labels:
+      app: dpdk-probe
+      role: receiver
+      stack: dpdk
+      # Cilium identity label (would be picked up by Cilium agent in k8s)
+      io.cilium/policy-id: "dpdk-probe"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # -- AF_XDP Receiver --------------------------------------------------------
+  af-xdp-rx:
+    <<: *base_probe
+    container_name: packet-eval-af-xdp-rx
+    build:
+      context: .
+      dockerfile: af_xdp/Dockerfile
+    hostname: af-xdp-rx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.3
+    environment:
+      PROBE_MODE: receiver
+      PROBE_IFACE: eth0
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    oom_score_adj: -500
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio:
+        soft: 99
+        hard: 99
+    labels:
+      app: af-xdp-probe
+      role: receiver
+      stack: af_xdp
+      io.cilium/policy-id: "af-xdp-probe"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # -- Kernel Stack Receiver --------------------------------------------------
+  kernel-rx:
+    <<: *base_probe
+    container_name: packet-eval-kernel-rx
+    build:
+      context: .
+      dockerfile: kernel/Dockerfile
+    hostname: kernel-rx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.4
+    environment:
+      PROBE_MODE: receiver
+    # Standard kernel path -- minimal capabilities needed
+    cap_add:
+      - NET_RAW
+    oom_score_adj: 0
+    labels:
+      app: kernel-probe
+      role: receiver
+      stack: kernel
+      io.cilium/policy-id: "kernel-probe"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+###############################################################################
+#  SENDER CONTAINERS                                                           #
+###############################################################################
+
+  # -- DPDK Sender -> AF_XDP Receiver (172.20.0.3) ---------------------------
+  dpdk-tx:
+    <<: *base_probe
+    container_name: packet-eval-dpdk-tx
+    build:
+      context: .
+      dockerfile: dpdk/Dockerfile
+    hostname: dpdk-tx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.5
+    environment:
+      PROBE_MODE: sender
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio:
+        soft: 99
+        hard: 99
+    depends_on:
+      - af-xdp-rx
+    # Argument: target_ip  num_packets
+    command: ["172.20.0.3", "2000"]
+    labels:
+      app: dpdk-probe
+      role: sender
+      stack: dpdk
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # -- AF_XDP Sender -> DPDK Receiver (172.20.0.2) ----------------------------
+  af-xdp-tx:
+    <<: *base_probe
+    container_name: packet-eval-af-xdp-tx
+    build:
+      context: .
+      dockerfile: af_xdp/Dockerfile
+    hostname: af-xdp-tx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.6
+    environment:
+      PROBE_MODE: sender
+      PROBE_IFACE: eth0
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio:
+        soft: 99
+        hard: 99
+    depends_on:
+      - dpdk-rx
+    command: ["172.20.0.2", "2000"]
+    labels:
+      app: af-xdp-probe
+      role: sender
+      stack: af_xdp
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # -- Kernel Sender -> Kernel Receiver (172.20.0.4) --------------------------
+  kernel-tx:
+    <<: *base_probe
+    container_name: packet-eval-kernel-tx
+    build:
+      context: .
+      dockerfile: kernel/Dockerfile
+    hostname: kernel-tx
+    networks:
+      eval_net:
+        ipv4_address: 172.20.0.7
+    environment:
+      PROBE_MODE: sender
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - kernel-rx
+    command: ["172.20.0.4", "2000"]
+    labels:
+      app: kernel-probe
+      role: sender
+      stack: kernel
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+###############################################################################
+#  COMPARATOR / ANALYSIS SIDECAR                                               #
+###############################################################################
+
+  # Waits for all probes to complete, then runs comparison analysis
+  comparator:
+    image: python:3.11-slim
+    container_name: packet-eval-comparator
+    volumes:
+      - ./comparator.py:/app/comparator.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    working_dir: /app
+    networks:
+      - mgmt_net
+    depends_on:
+      - dpdk-rx
+      - af-xdp-rx
+      - kernel-rx
+    entrypoint: >
+      sh -c "
+        pip install --quiet docker &&
+        echo 'Waiting 30s for probe containers to collect data...' &&
+        sleep 30 &&
+        python3 comparator.py
+      "
+    labels:
+      role: analysis
